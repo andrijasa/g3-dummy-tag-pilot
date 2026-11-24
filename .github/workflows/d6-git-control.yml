@@ -12,13 +12,31 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805da76410c181273ba90b1
-        with:
-          fetch-depth: 2
       - name: Compare authorized dummy refs with the same runner token
         shell: bash
+        env:
+          D6_RUNNER_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          temp=$(mktemp -d)
+          trap 'rm -rf -- "$temp"' EXIT
+          cat > "$temp/askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$D6_RUNNER_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$temp/askpass"
+          export GIT_ASKPASS="$temp/askpass" GIT_TERMINAL_PROMPT=0
+          export LC_ALL=C
+          git init -q "$temp/repo"
+          cd "$temp/repo"
+          git remote add origin https://github.com/andrijasa/g3-dummy-tag-pilot.git
+          git fetch -q --no-tags --depth=2 origin "$GITHUB_SHA"
+          git checkout --detach -q FETCH_HEAD
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
           initial=$(git rev-parse HEAD)
           alternate=$(git rev-parse HEAD~1)
