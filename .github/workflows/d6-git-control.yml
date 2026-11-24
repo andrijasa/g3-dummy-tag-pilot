@@ -1,0 +1,56 @@
+name: D6 Git transport control
+on:
+  push:
+    branches: [d6-git-control]
+    paths: [.github/workflows/d6-git-control.yml]
+permissions: {}
+jobs:
+  test:
+    if: github.repository == 'andrijasa/g3-dummy-tag-pilot' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+      - name: Compare authorized dummy refs with the same runner token
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          initial=$(git rev-parse HEAD)
+          alternate=$(git rev-parse HEAD~1)
+          [[ "$initial" != "$alternate" ]]
+          control="refs/tags/g3-d6-control/git-$GITHUB_RUN_ID"
+          claim="refs/tags/g3-d6-dummy/git-$GITHUB_RUN_ID"
+          check_ref() {
+            local actual
+            actual=$(git ls-remote --refs origin "$1" | cut -f1)
+            [[ "$actual" == "$2" ]]
+          }
+          git push origin "$initial:$control"
+          git push origin "+$alternate:$control"
+          check_ref "$control" "$alternate"
+          git push origin ":$control"
+          check_ref "$control" ""
+          echo "CONTROL PASS: unprotected tag created, changed and deleted"
+          git push origin "$initial:$claim"
+          check_ref "$claim" "$initial"
+          denied() {
+            local log
+            if log=$(git push origin "$1" 2>&1); then
+              echo "FAIL: protected $2 was allowed"
+              exit 1
+            fi
+            if ! grep -Eiq 'GH013|repository rule violations|protected tag' <<< "$log"; then
+              echo "HOLD: protected $2 lacked an explicit ruleset reason"
+              exit 1
+            fi
+            check_ref "$claim" "$initial"
+            echo "Protected $2 denied. Original SHA verified."
+          }
+          denied "+$alternate:$claim" update
+          denied ":$claim" deletion
+          echo "D6 PASS: Git transport, public dummy repository only"
