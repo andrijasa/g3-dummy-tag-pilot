@@ -34,16 +34,13 @@ jobs:
           git init -q "$temp/repo"
           cd "$temp/repo"
           git remote add origin https://github.com/andrijasa/g3-dummy-tag-pilot.git
-          git fetch -q --no-tags --depth=2 origin "$GITHUB_SHA"
-          git checkout --detach -q FETCH_HEAD
-          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
-          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
-          initial=$(git rev-parse HEAD)
-          git -c user.name='Dummy D6 runner' -c user.email='dummy@example.invalid' \
-            commit -q --allow-empty -m 'D6 alternate dummy ref with identical tree'
-          alternate=$(git rev-parse HEAD)
-          [[ "$initial" != "$alternate" ]]
+          git fetch -q --no-tags --depth=2 origin refs/heads/d6-seeded-targets
+          alternate=$(git rev-parse FETCH_HEAD)
+          initial=$(git rev-parse FETCH_HEAD~1)
+          [[ "$initial" == "771e7df8991042d7369083c8d22f100790a48fb8" ]]
+          [[ "$alternate" == "8bf7315b2102a705f3569eca2ca81fad06c207fc" ]]
           [[ "$(git rev-parse "$initial^{tree}")" == "$(git rev-parse "$alternate^{tree}")" ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
           control="refs/tags/g3-d6-control/git-$GITHUB_RUN_ID"
           claim="refs/tags/g3-d6-dummy/git-$GITHUB_RUN_ID"
           check_ref() {
