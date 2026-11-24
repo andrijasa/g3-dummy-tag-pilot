@@ -39,8 +39,11 @@ jobs:
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
           initial=$(git rev-parse HEAD)
-          alternate=$(git rev-parse HEAD~1)
+          git -c user.name='Dummy D6 runner' -c user.email='dummy@example.invalid' \
+            commit -q --allow-empty -m 'D6 alternate dummy ref with identical tree'
+          alternate=$(git rev-parse HEAD)
           [[ "$initial" != "$alternate" ]]
+          [[ "$(git rev-parse "$initial^{tree}")" == "$(git rev-parse "$alternate^{tree}")" ]]
           control="refs/tags/g3-d6-control/git-$GITHUB_RUN_ID"
           claim="refs/tags/g3-d6-dummy/git-$GITHUB_RUN_ID"
           check_ref() {
