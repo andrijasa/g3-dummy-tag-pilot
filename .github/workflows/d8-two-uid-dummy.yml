@@ -1,0 +1,165 @@
+Traceback (most recent call last):
+  File "<stdin>", line 36, in <module>
+  File "g3_d8_public_two_uid/d8-two-uid-dummy.yml", line 90
+    def exchange(directory, paths):
+         ^
+IndentationError: unexpected indent
+name: D8 two-UID public dummy pilot
+on:
+  push:
+    branches: [d8-two-uid-dummy]
+    paths: [.github/workflows/d8-two-uid-dummy.yml]
+permissions: {}
+jobs:
+  dummy-two-uid:
+    if: github.repository == 'andrijasa/g3-dummy-tag-pilot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Verify evaluator and caller filesystem isolation with dummy data
+        shell: bash
+        run: |
+          sudo -n /usr/bin/python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          from tempfile import TemporaryDirectory
+
+          EVALUATOR = 61001
+          CALLER = 61002
+          RECEIVED = b"RECORDED\n"
+          REJECTED = b"REJECTED\n"
+          REQUEST = b"dummy-fold-0\n"
+          scorer_source = """
+          import os
+          from pathlib import Path
+          import sys
+
+          def main():
+              if os.geteuid() != 61001 or os.getgroups():
+                  raise RuntimeError("wrong evaluator identity")
+              directory = Path(sys.argv[1])
+              checkpoint = directory / "checkpoint"
+              if not checkpoint.is_file() or checkpoint.read_bytes() != b"dummy-approved":
+                  print("REJECTED")
+                  return
+              if sys.stdin.buffer.readline(64) != b"dummy-fold-0\\n":
+                  print("REJECTED")
+                  return
+              try:
+                  with (directory / "result").open("xb") as result:
+                      result.write(b"dummy-private-result")
+              except FileExistsError:
+                  print("REJECTED")
+                  return
+              print("RECORDED")
+
+          main()
+          """
+          caller_source = """
+          import os
+          from pathlib import Path
+          import sys
+
+          def main():
+              if os.geteuid() != 61002 or os.getgroups():
+                  raise RuntimeError("wrong caller identity")
+              for name in sys.argv[1:]:
+                  try:
+                      Path(name).read_bytes()
+                  except PermissionError:
+                      continue
+                  raise RuntimeError("caller opened a protected path")
+              sys.stdout.buffer.write(b"dummy-fold-0\\n")
+
+          main()
+          """
+
+          def identity(uid):
+              return dict(user=uid, group=uid, extra_groups=[], umask=0o077)
+
+          def run_program(script, args, uid, payload=None):
+              result = subprocess.run(
+                  [sys.executable, "-I", "-B", "-c", script, *map(str, args)],
+                  input=payload, capture_output=True, check=True, timeout=5,
+                  **identity(uid),
+              )
+              if result.stderr:
+                  raise RuntimeError("unexpected child stderr")
+              return result.stdout
+
+          def caller_probe(paths):
+              if run_program(caller_source, paths, CALLER) != REQUEST:
+                  raise RuntimeError("caller fixture did not produce the expected request")
+
+          def exchange(directory, paths):
+              with subprocess.Popen(
+                  [sys.executable, "-I", "-B", str(directory / "scorer.py"), str(directory)],
+                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  **identity(EVALUATOR),
+              ) as evaluator:
+                  try:
+                      if evaluator.stdin is None:
+                          raise RuntimeError("missing request pipe")
+                      with subprocess.Popen(
+                          [sys.executable, "-I", "-B", "-c", caller_source, *map(str, paths)],
+                          stdout=evaluator.stdin, stderr=subprocess.PIPE,
+                          **identity(CALLER),
+                      ) as caller:
+                          evaluator.stdin.close()
+                      evaluator.stdin = None
+                          try:
+                              _, caller_stderr = caller.communicate(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              caller.kill()
+                              caller.communicate()
+                              raise
+                          if caller.returncode or caller_stderr:
+                              raise RuntimeError("caller did not complete cleanly")
+                      response, stderr = evaluator.communicate(timeout=5)
+                      if evaluator.returncode or stderr:
+                          raise RuntimeError("evaluator did not complete cleanly")
+                      # Read the reply under the same unprivileged caller identity.
+                      return run_program(
+                          "import os,sys; assert os.geteuid() == 61002; "
+                          "sys.stdout.buffer.write(sys.stdin.buffer.read(64))",
+                          [], CALLER, response,
+                      )
+                  except BaseException:
+                      if evaluator.poll() is None:
+                          evaluator.kill()
+                      evaluator.communicate()
+                      raise
+
+          with TemporaryDirectory(prefix="d8-public-dummy-", dir="/tmp") as tmp:
+              parent = Path(tmp)
+              parent.chmod(0o711)
+              directory = parent / "evaluator"
+              directory.mkdir(mode=0o700)
+              checkpoint = directory / "checkpoint"
+              scorer = directory / "scorer.py"
+              result = directory / "result"
+              checkpoint.write_bytes(b"dummy-approved")
+              scorer.write_text(scorer_source)
+              for path in (directory, scorer, checkpoint):
+                  os.chown(path, EVALUATOR, EVALUATOR)
+              scorer.chmod(0o600)
+              checkpoint.chmod(0o600)
+
+              if exchange(directory, [scorer, checkpoint]) != RECEIVED:
+                  raise RuntimeError("valid request was not recorded")
+              if result.read_bytes() != b"dummy-private-result" or result.stat().st_mode & 0o077:
+                  raise RuntimeError("private result did not match the fixture or its file mode")
+              caller_probe([scorer, checkpoint, result])
+              if exchange(directory, [scorer, checkpoint, result]) != REJECTED:
+                  raise RuntimeError("repeat was not rejected")
+              if result.read_bytes() != b"dummy-private-result":
+                  raise RuntimeError("repeat changed the result")
+              checkpoint.unlink()
+              if exchange(directory, [scorer, result]) != REJECTED:
+                  raise RuntimeError("missing checkpoint was not rejected")
+              print("PASS distinct non-root UIDs: evaluator=61001 caller=61002")
+              print("PASS caller denied direct reads of scorer, checkpoint and result")
+              print("PASS one RECORDED receipt; repeat and missing checkpoint REJECTED")
+          PY
