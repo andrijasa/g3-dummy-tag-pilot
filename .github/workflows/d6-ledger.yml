@@ -80,10 +80,23 @@ jobs:
           for method, payload in (("PATCH", {"sha": alternate, "force": True}), ("DELETE", None)):
               status, result = request(method, f"/git/refs/tags/{tag}", payload)
               require(not 200 <= status < 300, f"FAIL: {method} allowed")
-              require(status in (403, 422) and "GH013" in result.get("message", ""),
-                      f"HOLD: {method} lacks explicit ruleset rejection")
+              message = str(result.get("message", ""))
+              details = json.dumps(result.get("errors", []), sort_keys=True)
+              diagnostic = f"{message} {details}"
+              normalized = diagnostic.lower()
+              if status not in (403, 422) or not (
+                  "gh013" in normalized or
+                  ("repository rule violations found" in normalized and
+                   (("update" if method == "PATCH" else "delet") in normalized))
+              ):
+                  # The API call only targets a public synthetic ref. Log safe classification flags.
+                  print(f"Unexpected denial for {method}: HTTP {status}; "
+                        f"repository_rule_phrase={'repository rule violations found' in normalized}; "
+                        f"update_phrase={'update' in normalized}; deletion_phrase={'delet' in normalized}")
+                  raise SystemExit(f"HOLD: {method} lacks explicit ruleset rejection")
               status, current = request("GET", f"/git/ref/tags/{tag}")
               require(status == 200 and current.get("object", {}).get("sha") == initial,
                       f"FAIL: ref differs after {method}")
+              print(f"{method}: rejected by ruleset, original SHA verified")
           print("D6 PASS: create allowed, rule denies update/delete, original SHA verified")
           PY
