@@ -1,0 +1,78 @@
+name: D8 public dummy checkpoint gate
+on:
+  push:
+    branches: [d8-checkpoint-gate]
+    paths: [.github/workflows/d8-checkpoint-gate.yml]
+permissions: {}
+jobs:
+  verify:
+    if: github.repository == 'andrijasa/g3-dummy-tag-pilot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify live dummy claim and exercise fail-closed controls
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          """Read-only verifier for one independently retained dummy checkpoint."""
+          import hashlib
+          import hmac
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          REPO = "andrijasa/g3-dummy-tag-pilot"
+
+
+          def verify(checkpoint_bytes, expected_digest, snapshot):
+              if not hmac.compare_digest(hashlib.sha256(checkpoint_bytes).hexdigest(), expected_digest):
+                  return "HOLD_CHECKPOINT"
+              try:
+                  checkpoint = json.loads(checkpoint_bytes)
+                  ref = checkpoint["ref"]
+                  commit = checkpoint["commit"]
+                  if (checkpoint["repository"] != REPO
+                          or not re.fullmatch(r"refs/tags/g3-d6-dummy/git-[0-9]+", ref)
+                          or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+                      return "HOLD_CHECKPOINT"
+                  if snapshot["repository"] != REPO or snapshot["http_status"] != 200:
+                      return "HOLD_SOURCE"
+                  observed = snapshot["body"]
+                  if observed["ref"] != ref or observed["object"]["type"] != "commit":
+                      return "HOLD_SOURCE"
+                  return "MATCH" if observed["object"]["sha"] == commit else "HOLD_CHANGED"
+              except (KeyError, TypeError, ValueError):
+                  return "HOLD_SOURCE"
+
+
+
+          import base64
+          import copy
+          from urllib.request import urlopen
+
+          checkpoint = base64.b64decode("ewogICJyZXBvc2l0b3J5IjogImFuZHJpamFzYS9nMy1kdW1teS10YWctcGlsb3QiLAogICJyZWYiOiAicmVmcy90YWdzL2czLWQ2LWR1bW15L2dpdC00NTM1MjYwNjk1MyIsCiAgImNvbW1pdCI6ICI3NzFlN2RmODk5MTA0MmQ3MzY5MDgzYzhkMjJmMTAwNzkwYTQ4ZmI4IiwKICAic291cmNlX3J1biI6IDQ1MzUyNjA2OTUzLAogICJzb3VyY2Vfam9iIjogMTM4MzAyNTAzMjM2LAogICJ3b3JrZmxvd19oZWFkIjogIjdhZDhiZTdkZjRmMTk2MjBkNWU2NjZhYjBjZTFiYTNlZjFhNDI1YjIiLAogICJzY29wZSI6ICJzaW5nbGUgc3ludGhldGljIEQ2IGNsYWltIgp9Cg==", validate=True)
+          pin = "f33c10449f14ddffd8a3a114eec896f2a224248eda234c7ea825d4d877ac7912"
+          ref = "refs/tags/g3-d6-dummy/git-45352606953"
+          with urlopen("https://api.github.com/repos/" + REPO + "/git/ref/" + ref.removeprefix("refs/"), timeout=15) as response:
+              snapshot = {"repository": REPO, "http_status": response.status, "body": json.load(response)}
+
+          def dispatch(name, candidate, state, expected):
+              verdict = verify(candidate, pin, state)
+              entries = []
+              if verdict == "MATCH":
+                  entries.append("dummy-evaluator")
+              if verdict != expected or len(entries) != int(expected == "MATCH"):
+                  raise SystemExit(f"FAIL {name} {verdict} scorer_calls={len(entries)}")
+              print(f"{name}: {verdict} scorer_calls={len(entries)}")
+
+          dispatch("live-claim", checkpoint, snapshot, "MATCH")
+          missing = dict(snapshot, http_status=404, body={})
+          dispatch("simulated-missing-claim", checkpoint, missing, "HOLD_SOURCE")
+          changed = copy.deepcopy(snapshot)
+          changed["body"]["object"]["sha"] = "0" * 40
+          dispatch("simulated-changed-claim", checkpoint, changed, "HOLD_CHANGED")
+          co_restored = json.loads(checkpoint)
+          co_restored["commit"] = "0" * 40
+          dispatch("simulated-joint-rollback", json.dumps(co_restored).encode(), changed, "HOLD_CHECKPOINT")
+          PY
