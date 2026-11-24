@@ -73,30 +73,36 @@ jobs:
           alternate = parents[0]["sha"]
           require(re.fullmatch(r"[a-f0-9]{40}", alternate) and alternate != initial,
                   "HOLD: invalid alternate commit")
+          def create_tag(tag):
+              status, result = request("POST", "/git/refs", {"ref": f"refs/tags/{tag}", "sha": initial})
+              require(status == 201 and result.get("object", {}).get("sha") == initial,
+                      "HOLD: create not confirmed")
+
+          control = f"g3-d6-control/run-{run}"
+          create_tag(control)
+          status, updated = request("PATCH", f"/git/refs/tags/{control}",
+                                    {"sha": alternate, "force": True})
+          require(status == 200 and updated.get("object", {}).get("sha") == alternate,
+                  f"HOLD: unprotected update control returned HTTP {status}")
+          status, _ = request("DELETE", f"/git/refs/tags/{control}")
+          require(status == 204, f"HOLD: unprotected delete control returned HTTP {status}")
+          status, _ = request("GET", f"/git/ref/tags/{control}")
+          require(status == 404, "HOLD: deleted control still visible")
+          print("Control: same token allowed to create, update and delete an unprotected tag")
+
           tag = f"g3-d6-dummy/run-{run}"
-          status, result = request("POST", "/git/refs", {"ref": f"refs/tags/{tag}", "sha": initial})
-          require(status == 201 and result.get("object", {}).get("sha") == initial,
-                  "HOLD: control create not confirmed")
+          create_tag(tag)
           for method, payload in (("PATCH", {"sha": alternate, "force": True}), ("DELETE", None)):
               status, result = request(method, f"/git/refs/tags/{tag}", payload)
-              require(not 200 <= status < 300, f"FAIL: {method} allowed")
-              message = str(result.get("message", ""))
-              details = json.dumps(result.get("errors", []), sort_keys=True)
-              diagnostic = f"{message} {details}"
-              normalized = diagnostic.lower()
-              if status not in (403, 422) or not (
-                  "gh013" in normalized or
-                  ("repository rule violations found" in normalized and
-                   (("update" if method == "PATCH" else "delet") in normalized))
-              ):
-                  # The API call only targets a public synthetic ref. Log safe classification flags.
-                  print(f"Unexpected denial for {method}: HTTP {status}; "
-                        f"repository_rule_phrase={'repository rule violations found' in normalized}; "
-                        f"update_phrase={'update' in normalized}; deletion_phrase={'delet' in normalized}")
-                  raise SystemExit(f"HOLD: {method} lacks explicit ruleset rejection")
-              status, current = request("GET", f"/git/ref/tags/{tag}")
-              require(status == 200 and current.get("object", {}).get("sha") == initial,
+              require(not 200 <= status < 300, f"FAIL: protected {method} allowed")
+              require(status in (403, 422), f"HOLD: protected {method} returned HTTP {status}")
+              if status == 422:
+                  details = json.dumps(result).lower()
+                  require("gh013" in details or "repository rule violations found" in details,
+                          f"HOLD: protected {method} returned an ambiguous validation response")
+              read_status, current = request("GET", f"/git/ref/tags/{tag}")
+              require(read_status == 200 and current.get("object", {}).get("sha") == initial,
                       f"FAIL: ref differs after {method}")
-              print(f"{method}: rejected by ruleset, original SHA verified")
-          print("D6 PASS: create allowed, rule denies update/delete, original SHA verified")
+              print(f"Protected {method}: HTTP {status}, original SHA verified")
+          print("D6 PASS: matched permission controls and unchanged protected tag")
           PY
