@@ -1,9 +1,3 @@
-Traceback (most recent call last):
-  File "<stdin>", line 36, in <module>
-  File "g3_d8_public_two_uid/d8-two-uid-dummy.yml", line 90
-    def exchange(directory, paths):
-         ^
-IndentationError: unexpected indent
 name: D8 two-UID public dummy pilot
 on:
   push:
@@ -108,7 +102,7 @@ jobs:
                           **identity(CALLER),
                       ) as caller:
                           evaluator.stdin.close()
-                      evaluator.stdin = None
+                          evaluator.stdin = None
                           try:
                               _, caller_stderr = caller.communicate(timeout=5)
                           except subprocess.TimeoutExpired:
