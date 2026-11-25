@@ -1,0 +1,35 @@
+name: G4 Ubuntu hub candidate VM
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  ubuntu-hub-candidate:
+    if: github.repository == 'andrijasa/g3-dummy-tag-pilot' && github.event.repository.private == false && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify Ubuntu and local UDP loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import platform
+          import socket
+          
+          with open("/etc/os-release", encoding="utf-8") as release:
+              os_name = next(line.strip() for line in release if line.startswith("PRETTY_NAME="))
+          
+          with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as hub:
+              hub.bind(("127.0.0.1", 51820))
+              hub.settimeout(3)
+              with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                  client.sendto(b"g4-synthetic-udp", ("127.0.0.1", 51820))
+                  packet, address = hub.recvfrom(128)
+              if packet != b"g4-synthetic-udp" or address[0] != "127.0.0.1":
+                  raise RuntimeError("Unexpected UDP loopback result")
+          
+          print(os_name)
+          print(f"Architecture: {platform.machine()}")
+          print("PASS: UDP 51820 loopback send and receive")
+          print("Scope: one ephemeral runner; no remote UDP reachability measured")
+          PY
