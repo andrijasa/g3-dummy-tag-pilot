@@ -1,0 +1,173 @@
+name: G4 PostgreSQL synthetic writer and rollback pilot
+on:
+  workflow_dispatch:
+    inputs:
+      review_code:
+        description: Enter G4-PG-SYNTHETIC
+        required: true
+        type: string
+permissions: {}
+jobs:
+  verify:
+    if: github.repository == 'andrijasa/g3-dummy-tag-pilot' && github.event.repository.private == false && github.run_attempt == 1 && inputs.review_code == 'G4-PG-SYNTHETIC'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Promote synthetic standby and reject stale authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$(mktemp -d)"
+          trap 'rm -rf -- "$fixture"' EXIT
+          cd "$fixture"
+          cat > pilot_postgres.sh <<'G4_PG_FIXTURE'
+          #!/usr/bin/env bash
+          # Synthetic, single-VM fixture. Never points at pre-existing PostgreSQL.
+          set -euo pipefail
+          umask 077
+
+          pgbin=${PGBIN:-/usr/lib/postgresql/16/bin}
+          for program in initdb pg_ctl pg_basebackup psql; do
+              test -x "$pgbin/$program" || { echo "Missing PostgreSQL tool: $program" >&2; exit 1; }
+          done
+          test "$(id -u)" -ne 0 || { echo "Use the unprivileged runner identity" >&2; exit 1; }
+
+          work=$(mktemp -d /tmp/g4pg.XXXXXX)
+          primary="$work/primary"
+          standby="$work/standby"
+          restored="$work/restored"
+          witness="$work/witness/generation"
+          sink="$work/sink"
+          port=55432
+          role=g4_stage
+
+          cleanup() {
+              for directory in "$restored" "$standby" "$primary"; do
+                  if test -f "$directory/postmaster.pid"; then
+                      "$pgbin/pg_ctl" -D "$directory" -w -t 10 -m immediate stop >&2 || true
+                  fi
+              done
+              rm -rf -- "$work"
+          }
+          trap cleanup EXIT
+
+          # The shell's private socket directories prevent connection by other job accounts.
+          mkdir "$work/p.sock" "$work/s.sock" "$work/r.sock" "$work/witness" "$sink"
+
+          start() {
+              local data="$1" sock="$2" sync_names
+              sync_names="-c synchronous_standby_names=''"
+              # Independent socket paths and no TCP listening on all instances.
+              "$pgbin/pg_ctl" -D "$data" -l "$data/stage-server.log" -w -t 12 \
+                  -o "-k $sock -p $port -c listen_addresses='' $sync_names" start >&2
+          }
+
+          sql() {
+              local sock="$1"
+              shift
+              "$pgbin/psql" -X -qAt -v ON_ERROR_STOP=1 -h "$sock" -p "$port" -U "$role" -d postgres "$@"
+          }
+
+          expect() {
+              if [[ "$1" != "$2" ]]; then
+                  printf 'FAIL %s: expected %s; got %s\n' "$3" "$2" "$1" >&2
+                  exit 1
+              fi
+          }
+
+          wait_for_standby() {
+              local i
+              for i in {1..25}; do
+                  if [[ "$(sql "$work/p.sock" -c "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' AND sync_state = 'sync'")" == 1 ]]; then
+                      return 0
+                  fi
+                  sleep 1
+              done
+              echo "No synchronous standby was observed" >&2
+              return 1
+          }
+
+          claim() {
+              local sock="$1" scope="$2" generation outcome
+              if [[ ! -r "$witness" ]] || ! IFS= read -r generation < "$witness" || [[ ! "$generation" =~ ^[1-9][0-9]{0,8}$ ]]; then
+                  echo WITNESS_UNAVAILABLE
+                  return
+              fi
+
+              # This statement checks authority and reserves a fold atomically in PostgreSQL.
+              outcome=$(sql "$sock" -v generation="$generation" -v scope="$scope" <<'SQL'
+          SET statement_timeout = '10s';
+          SET synchronous_commit = 'remote_apply';
+          WITH authority AS (
+              SELECT generation FROM ledger_generation WHERE id = 1
+          ), reservation AS (
+              INSERT INTO reservations (scope, fold)
+              SELECT :'scope', 0 FROM authority WHERE generation = :generation
+              ON CONFLICT (scope, fold) DO NOTHING
+              RETURNING scope
+          )
+          SELECT CASE
+              WHEN NOT EXISTS (SELECT 1 FROM authority WHERE generation = :generation) THEN 'STALE_AUTHORITY'
+              WHEN EXISTS (SELECT 1 FROM reservation) THEN 'RECORDED'
+              ELSE 'REJECTED'
+          END;
+          SQL
+              ) || return
+              if [[ "$outcome" == RECORDED ]]; then
+                  (set -C; printf 'synthetic result for %s\n' "$scope" > "$sink/$scope") || return
+              fi
+              printf '%s\n' "$outcome"
+          }
+
+          "$pgbin/initdb" -D "$primary" -A trust --no-locale --username="$role" >&2
+          # Set via a file so ALTER SYSTEM can set the sync policy after the standby connects.
+          "$pgbin/pg_ctl" -D "$primary" -l "$primary/stage-server.log" -w -t 12 \
+              -o "-k $work/p.sock -p $port -c listen_addresses=''" start >&2
+          sql "$work/p.sock" <<'SQL'
+          CREATE TABLE ledger_generation (id int primary key CHECK (id = 1), generation int NOT NULL);
+          INSERT INTO ledger_generation VALUES (1, 1);
+          CREATE TABLE reservations (scope text, fold smallint, PRIMARY KEY (scope, fold));
+          SQL
+          "$pgbin/pg_basebackup" -h "$work/p.sock" -p "$port" -U "$role" -D "$restored" --wal-method=stream
+          "$pgbin/pg_basebackup" -h "$work/p.sock" -p "$port" -U "$role" -D "$standby" --wal-method=stream --write-recovery-conf
+          start "$standby" "$work/s.sock"
+          expect "$(sql "$work/s.sock" -c 'SELECT pg_is_in_recovery()')" t "standby initially in recovery"
+          sql "$work/p.sock" -c "ALTER SYSTEM SET synchronous_standby_names = '*'"
+          expect "$(sql "$work/p.sock" -c 'SELECT pg_reload_conf()')" t "primary reload"
+          wait_for_standby
+          sql "$work/p.sock" <<'SQL'
+          SET statement_timeout = '10s';
+          SET synchronous_commit = 'remote_apply';
+          UPDATE ledger_generation SET generation = 2 WHERE id = 1;
+          SQL
+          printf '2\n' > "$witness"
+          expect "$(claim "$work/p.sock" dummy-a)" RECORDED "first reservation"
+          expect "$(sql "$work/s.sock" -c "SELECT count(*) FROM reservations WHERE scope='dummy-a' AND fold=0")" 1 "replica applied committed reservation"
+          original_digest=$(sha256sum "$sink/dummy-a")
+
+          "$pgbin/pg_ctl" -D "$primary" -w -t 12 -m fast stop >&2
+          "$pgbin/pg_ctl" -D "$standby" -w -t 12 promote >&2
+          expect "$(sql "$work/s.sock" -c 'SELECT pg_is_in_recovery()')" f "standby promoted"
+          expect "$(claim "$work/s.sock" dummy-a)" REJECTED "old fold after promotion"
+          expect "$(claim "$work/s.sock" dummy-b)" RECORDED "fresh fold after promotion"
+          expect "$(sha256sum "$sink/dummy-a")" "$original_digest" "original result after failover"
+          echo 'PASS primary stopped, standby promoted, old fold denied, fresh fold recorded'
+
+          start "$restored" "$work/r.sock"
+          expect "$(sql "$work/r.sock" -c 'SELECT generation FROM ledger_generation')" 1 "snapshot generation"
+          expect "$(sql "$work/r.sock" -c 'SELECT count(*) FROM reservations')" 0 "snapshot before reservation"
+          expect "$(claim "$work/r.sock" dummy-a)" STALE_AUTHORITY "rollback rejection"
+          expect "$(sql "$work/r.sock" -c 'SELECT count(*) FROM reservations')" 0 "rollback side effects"
+          expect "$(sha256sum "$sink/dummy-a")" "$original_digest" "original result after rollback"
+          echo 'PASS restored older snapshot blocked by independent-of-PGDATA witness fixture'
+
+          mv "$witness" "$work/witness/withheld"
+          expect "$(claim "$work/s.sock" dummy-c)" WITNESS_UNAVAILABLE "witness outage"
+          expect "$(sql "$work/s.sock" -c "SELECT count(*) FROM reservations WHERE scope='dummy-c'")" 0 "witness outage side effects"
+          test ! -e "$sink/dummy-c"
+          echo 'PASS witness unavailable blocked a fresh fold before reservation and result write'
+          G4_PG_FIXTURE
+          sha256sum -c <<'G4_PG_CHECKSUM'
+          eda4b4552ae24943a6fca7f70dff46715f1e5fc53b5e8e651219802c31a81b0b  pilot_postgres.sh
+          G4_PG_CHECKSUM
+          bash pilot_postgres.sh
