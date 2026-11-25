@@ -1,0 +1,124 @@
+name: G4 public dummy two-runner reservation pilot
+on:
+  workflow_dispatch:
+    inputs:
+      review_code:
+        description: Enter G4-DUMMY-TWO-RUNNERS
+        type: string
+        required: true
+permissions: {}
+jobs:
+  contend:
+    if: github.repository == 'andrijasa/g3-dummy-tag-pilot' && github.event.repository.private == false && github.run_attempt == 1 && inputs.review_code == 'G4-DUMMY-TWO-RUNNERS'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        lane: [a, b]
+    steps:
+      - name: Claim one synthetic reservation
+        shell: bash
+        env:
+          LANE: ${{ matrix.lane }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I -B - <<'G4_PILOT_PY'
+          """Synthetic-only two-runner reservation probe for the public dummy repository."""
+          from datetime import datetime, timezone
+          import json
+          import os
+          import re
+          import time
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          REPO = "andrijasa/g3-dummy-tag-pilot"
+          API = f"https://api.github.com/repos/{REPO}/git"
+          PREFIX = "tags/g3-d6-dummy"
+          CONTENDERS = ("a", "b")
+
+
+          def request(method, path, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Content-Type": "application/json",
+              }
+              req = Request(f"{API}/{path}", data=data, method=method, headers=headers)
+              try:
+                  with urlopen(req, timeout=8) as response:
+                      return response.status, json.load(response)
+              except HTTPError as error:
+                  with error:
+                      return error.code, {}
+
+
+          def observed(ref, sha):
+              status, body = request("GET", f"ref/{ref}")
+              if status == 404:
+                  return False
+              if status != 200 or body["ref"] != f"refs/{ref}" or body["object"]["sha"] != sha:
+                  raise RuntimeError(f"unexpected read status or identity: HTTP {status}")
+              return True
+
+
+          def create(ref, sha):
+              return request("POST", "refs", {"ref": f"refs/{ref}", "sha": sha})[0]
+
+
+          def await_refs(refs, sha, seconds):
+              until = time.monotonic() + seconds
+              while time.monotonic() < until:
+                  if all(observed(ref, sha) for ref in refs):
+                      return
+                  time.sleep(1.5)
+              raise RuntimeError("timed out waiting for matching refs")
+
+
+          def verdict(status, readback_matches):
+              if not readback_matches:
+                  raise RuntimeError("claim ref could not be verified")
+              if status == 201:
+                  return "CREATED"
+              if status in (409, 422):
+                  return "NO_CREATE_REF_PRESENT"
+              raise RuntimeError(f"unexpected create status: HTTP {status}")
+
+
+          def utc():
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def main():
+              if os.environ.get("GITHUB_REPOSITORY") != REPO or os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
+                  raise RuntimeError("wrong repository or run attempt")
+              round_id, lane, sha = (os.environ[name] for name in ("GITHUB_RUN_ID", "LANE", "GITHUB_SHA"))
+              if not re.fullmatch("[0-9]{1,20}", round_id) or lane not in CONTENDERS or not re.fullmatch("[0-9a-f]{40}", sha):
+                  raise RuntimeError("invalid run context")
+              stem = f"{PREFIX}/g4-ledger-{round_id}"
+              claim = f"{stem}-claim"
+              ready_refs = [f"{stem}-ready-{contender}" for contender in CONTENDERS]
+              own = ready_refs[CONTENDERS.index(lane)]
+              if observed(claim, sha) or observed(own, sha):
+                  raise RuntimeError("round already exists")
+              if create(own, sha) != 201:
+                  raise RuntimeError("could not publish readiness")
+              await_refs(ready_refs, sha, seconds=60)
+              started = utc()
+              status = create(claim, sha)
+              finished = utc()
+              await_refs([claim], sha, seconds=12)
+              result = verdict(status, observed(claim, sha))
+              print(json.dumps(dict(run=round_id, lane=lane, request_started_utc=started,
+                                    request_finished_utc=finished, status=status, verdict=result,
+                                    ref=f"refs/{claim}", commit=sha), sort_keys=True))
+
+
+          if __name__ == "__main__":
+              main()
+          G4_PILOT_PY
